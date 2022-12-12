@@ -1,6 +1,6 @@
-# ChatGPT Personal Assistant
+# GPT-3 Personal Assistant
 
-Interact with ChatGPT vocally, using both STT (speech-to-text) and TTS (text-to-speech), with keyboard prompts as a fallback.
+Interact with GPT-3 vocally, using both STT (speech-to-text) and TTS (text-to-speech).
 
 ## Setup
 
