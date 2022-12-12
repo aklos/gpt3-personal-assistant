@@ -4,64 +4,33 @@ import openai
 import requests
 import pyaudio
 import wave
-import stt
-import time
-import logging
-import threading
-import collections
-import queue
-import os.path
-import numpy as np
-import webrtcvad
-from pynput.keyboard import Key, Listener
-from scipy import signal
-from halo import Halo
+import whisper
+import speech_recognition as sr
 from dotenv import load_dotenv
-from datetime import datetime
-
-logging.basicConfig(level=20)
+from tempfile import NamedTemporaryFile
+from datetime import datetime, timedelta
+from queue import Queue
+from time import sleep
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 
 def main():
+    audio_model = whisper.load_model("base.en")
+
+    print("Model loaded.\n")
+
     while True:
-        prompt = ""
-        use_stt = False
-
-        # def on_press(key):
-        #     global use_stt
-        #     try:
-        #         if key.char == "y":
-        #             use_stt = True
-        #             return False
-        #         if key.char == "n":
-        #             return False
-        #     except:
-        #         pass
-
-        value = input("Use speech to text? (y/n): ")
-
-        if value not in ["y", "n"]:
-            continue
-        elif value == "y":
-            use_stt = True
-
-        if use_stt:
-            prompt = speech_to_text()
-        else:
-            prompt = input("Write prompt: ")
-
-        if prompt:
+        prompt = speech_to_text(audio_model)
+        if len(prompt):
             response = prompt_chatgpt(prompt)
-            print(response)
         text_to_speech(response)
 
 
 def prompt_chatgpt(prompt):
     r = openai.Completion.create(
-        model="text-davinci-003", prompt=prompt, temperature=0, max_tokens=256)
+        model="text-davinci-003", prompt=prompt, temperature=0.7, max_tokens=96)
     return r["choices"][0]["text"].strip()
 
 
@@ -82,183 +51,90 @@ def text_to_speech(text):
     pa_stream.write(r.content)
 
 
-def speech_to_text():
-    model = stt.Model("stt_models/en.tflite")
-    vad_audio = VADAudio(aggressiveness=3,
-                         input_rate=16000)
-    print("Listening (Ctrl+c to stop)...")
-    frames = vad_audio.vad_collector()
+def speech_to_text(audio_model):
+    transcription = ['']
+    record_timeout = 2
+    phrase_timeout = 2
+    temp_file = NamedTemporaryFile().name
 
-    result = ""
+    phrase_time = None
+    last_sample = bytes()
+    data_queue = Queue()
 
-    try:
-        spinner = Halo(spinner='line')
-        stream_context = model.createStream()
-        wav_data = bytearray()
-        for frame in frames:
-            if frame is not None:
-                spinner.start()
-                logging.debug("streaming frame")
-                stream_context.feedAudioContent(np.frombuffer(frame, np.int16))
-            else:
-                if spinner:
-                    spinner.stop()
-                logging.debug("end utterence")
-                text = stream_context.finishStream()
-                print("Recognized: %s" % text)
-                result += text + "\n"
-                stream_context = model.createStream()
-        # listener.join()
-    except KeyboardInterrupt:
-        pass
+    recorder = sr.Recognizer()
+    recorder.energy_threshold = 1000
+    recorder.dynamic_energy_threshold = False
 
-    return result.strip()
+    source = sr.Microphone(sample_rate=16000)
+    with source:
+        recorder.adjust_for_ambient_noise(source)
 
+    def record_callback(_, audio: sr.AudioData) -> None:
+        data = audio.get_raw_data()
+        data_queue.put(data)
 
-class Audio(object):
-    """Streams raw audio from microphone. Data is received in a separate thread, and stored in a buffer, to be read from."""
+    recorder.listen_in_background(
+        source, record_callback, phrase_time_limit=record_timeout)
 
-    FORMAT = pyaudio.paInt16
-    # Network/VAD rate-space
-    RATE_PROCESS = 16000
-    CHANNELS = 1
-    BLOCKS_PER_SECOND = 50
+    print('Enter prompt...')
 
-    def __init__(self, callback=None, device=None, input_rate=RATE_PROCESS, file=None):
-        def proxy_callback(in_data, frame_count, time_info, status):
-            if self.chunk is not None:
-                in_data = self.wf.readframes(self.chunk)
-            callback(in_data)
-            return (None, pyaudio.paContinue)
-        if callback is None:
-            def callback(in_data): return self.buffer_queue.put(in_data)
-        self.buffer_queue = queue.Queue()
-        self.device = device
-        self.input_rate = input_rate
-        self.sample_rate = self.RATE_PROCESS
-        self.block_size = int(self.RATE_PROCESS /
-                              float(self.BLOCKS_PER_SECOND))
-        self.block_size_input = int(
-            self.input_rate / float(self.BLOCKS_PER_SECOND))
-        self.pa = pyaudio.PyAudio()
+    while True:
+        try:
+            now = datetime.utcnow()
+            # Pull raw recorded audio from the queue.
+            if not data_queue.empty():
+                phrase_complete = False
+                # If enough time has passed between recordings, consider the phrase complete.
+                # Clear the current working audio buffer to start over with the new data.
+                if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
+                    last_sample = bytes()
+                    phrase_complete = True
+                    if len(transcription) > 0:
+                        break
+                # This is the last time we received new audio data from the queue.
+                phrase_time = now
 
-        kwargs = {
-            'format': self.FORMAT,
-            'channels': self.CHANNELS,
-            'rate': self.input_rate,
-            'input': True,
-            'frames_per_buffer': self.block_size_input,
-            'stream_callback': proxy_callback,
-        }
+                # Concatenate our current audio data with the latest audio data.
+                while not data_queue.empty():
+                    data = data_queue.get()
+                    last_sample += data
 
-        self.chunk = None
-        # if not default device
-        if self.device:
-            kwargs['input_device_index'] = self.device
-        elif file is not None:
-            self.chunk = 320
-            self.wf = wave.open(file, 'rb')
+                # Use AudioData to convert the raw data to wav data.
+                audio_data = sr.AudioData(
+                    last_sample, source.SAMPLE_RATE, source.SAMPLE_WIDTH)
+                wav_data = io.BytesIO(audio_data.get_wav_data())
 
-        self.stream = self.pa.open(**kwargs)
-        self.stream.start_stream()
+                # Write wav data to the temporary file as bytes.
+                with open(temp_file, 'w+b') as f:
+                    f.write(wav_data.read())
 
-    def resample(self, data, input_rate):
-        """
-        Microphone may not support our native processing sampling rate, so
-        resample from input_rate to RATE_PROCESS here for webrtcvad and
-        stt
+                # Read the transcription.
+                result = audio_model.transcribe(temp_file)
+                text = result['text'].strip()
 
-        Args:
-            data (binary): Input audio stream
-            input_rate (int): Input audio rate to resample from
-        """
-        data16 = np.fromstring(string=data, dtype=np.int16)
-        resample_size = int(len(data16) / self.input_rate * self.RATE_PROCESS)
-        resample = signal.resample(data16, resample_size)
-        resample16 = np.array(resample, dtype=np.int16)
-        return resample16.tostring()
+                # If we detected a pause between recordings, add a new item to our transcripion.
+                # Otherwise edit the existing one.
+                if phrase_complete:
+                    transcription.append(text)
+                else:
+                    transcription[-1] = text
 
-    def read_resampled(self):
-        """Return a block of audio data resampled to 16000hz, blocking if necessary."""
-        return self.resample(data=self.buffer_queue.get(),
-                             input_rate=self.input_rate)
+                # Clear the console to reprint the updated transcription.
+                os.system('cls' if os.name == 'nt' else 'clear')
+                for line in transcription:
+                    print(line)
+                # Flush stdout.
+                print('', end='', flush=True)
 
-    def read(self):
-        """Return a block of audio data, blocking if necessary."""
-        return self.buffer_queue.get()
+                # Infinite loops are bad for processors, must sleep.
+                sleep(0.25)
+        except KeyboardInterrupt:
+            break
 
-    def destroy(self):
-        self.stream.stop_stream()
-        self.stream.close()
-        self.pa.terminate()
-
-    frame_duration_ms = property(
-        lambda self: 1000 * self.block_size // self.sample_rate)
-
-    def write_wav(self, filename, data):
-        logging.info("write wav %s", filename)
-        wf = wave.open(filename, 'wb')
-        wf.setnchannels(self.CHANNELS)
-        # wf.setsampwidth(self.pa.get_sample_size(FORMAT))
-        assert self.FORMAT == pyaudio.paInt16
-        wf.setsampwidth(2)
-        wf.setframerate(self.sample_rate)
-        wf.writeframes(data)
-        wf.close()
-
-
-class VADAudio(Audio):
-    """Filter & segment audio with voice activity detection."""
-
-    def __init__(self, aggressiveness=3, device=None, input_rate=None, file=None):
-        super().__init__(device=device, input_rate=input_rate, file=file)
-        self.vad = webrtcvad.Vad(aggressiveness)
-
-    def frame_generator(self):
-        """Generator that yields all audio frames from microphone."""
-        if self.input_rate == self.RATE_PROCESS:
-            while True:
-                yield self.read()
-        else:
-            while True:
-                yield self.read_resampled()
-
-    def vad_collector(self, padding_ms=300, ratio=0.75, frames=None):
-        """Generator that yields series of consecutive audio frames comprising each utterence, separated by yielding a single None.
-            Determines voice activity by ratio of frames in padding_ms. Uses a buffer to include padding_ms prior to being triggered.
-            Example: (frame, ..., frame, None, frame, ..., frame, None, ...)
-                      |---utterence---|        |---utterence---|
-        """
-        if frames is None:
-            frames = self.frame_generator()
-        num_padding_frames = padding_ms // self.frame_duration_ms
-        ring_buffer = collections.deque(maxlen=num_padding_frames)
-        triggered = False
-
-        for frame in frames:
-            if len(frame) < 640:
-                return
-
-            is_speech = self.vad.is_speech(frame, self.sample_rate)
-
-            if not triggered:
-                ring_buffer.append((frame, is_speech))
-                num_voiced = len([f for f, speech in ring_buffer if speech])
-                if num_voiced > ratio * ring_buffer.maxlen:
-                    triggered = True
-                    for f, s in ring_buffer:
-                        yield f
-                    ring_buffer.clear()
-
-            else:
-                yield frame
-                ring_buffer.append((frame, is_speech))
-                num_unvoiced = len(
-                    [f for f, speech in ring_buffer if not speech])
-                if num_unvoiced > ratio * ring_buffer.maxlen:
-                    triggered = False
-                    yield None
-                    ring_buffer.clear()
+    print("\n\nTranscription:")
+    for line in transcription:
+        print(line)
+    return transcription[0]
 
 
 if __name__ == "__main__":
